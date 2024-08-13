@@ -32,7 +32,6 @@ import (
 )
 
 func TOTP(t int, key string) string {
-
 	cfg := otp.Config{
 		Hash:     sha1.New,
 		Digits:   6,
