@@ -53,6 +53,7 @@ func main() {
 	sourcePort := flag.Int("sp", 0, "Source port number")
 	dest := flag.String("d", "", "Destination multiaddr string")
 	key := flag.String("o", "", "OTP key")
+	rendezvous := flag.String("r", "", "Rendezvous string")
 	help := flag.Bool("help", false, "Display help")
 	flag.Parse()
 
@@ -130,6 +131,11 @@ func main() {
 			// generate random string
 			otp := TOTP(10, *key)
 			logrus.Info("OTP: ", otp)
+
+			if rendezvous != nil && len(*rendezvous) > 0 {
+				otp = *rendezvous
+			}
+
 			_, _ = routingDiscovery.Advertise(ctx, otp)
 			time.Sleep(1 * time.Second)
 
