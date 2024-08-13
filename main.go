@@ -1,8 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,58 +22,27 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/sirupsen/logrus"
 
+	"github.com/creachadair/otp"
 	ds "github.com/ipfs/go-datastore"
 	dsync "github.com/ipfs/go-datastore/sync"
-	"github.com/libp2p/go-libp2p/core/discovery"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
-	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	routedhost "github.com/libp2p/go-libp2p/p2p/host/routed"
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/multiformats/go-multiaddr"
 )
 
-func handleStream(s network.Stream) {
-	logrus.Println("Got a new stream!")
+func TOTP(t int, key string) string {
 
-	// Create a buffer stream for non-blocking read and write.
-	rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
-
-	go readData(rw)
-	go writeData(rw)
-
-	// stream 's' will stay open until you close it (or the other side closes it).
-}
-
-func readData(rw *bufio.ReadWriter) {
-	for {
-		str, _ := rw.ReadString('\n')
-
-		if str == "" {
-			return
-		}
-		if str != "\n" {
-			// Green console colour: 	\x1b[32m
-			// Reset console colour: 	\x1b[0m
-			fmt.Printf("\x1b[32m%s\x1b[0m> ", str)
-		}
-
+	cfg := otp.Config{
+		Hash:     sha1.New,
+		Digits:   6,
+		TimeStep: otp.TimeWindow(t),
+		Key:      key,
+		Format: func(hash []byte, nb int) string {
+			return base64.StdEncoding.EncodeToString(hash)[:nb]
+		},
 	}
-}
-
-func writeData(rw *bufio.ReadWriter) {
-	stdReader := bufio.NewReader(os.Stdin)
-
-	for {
-		fmt.Print("> ")
-		sendData, err := stdReader.ReadString('\n')
-		if err != nil {
-			logrus.Println(err)
-			return
-		}
-
-		rw.WriteString(fmt.Sprintf("%s\n", sendData))
-		rw.Flush()
-	}
+	return cfg.TOTP()
 }
 
 func main() {
@@ -83,6 +53,7 @@ func main() {
 
 	sourcePort := flag.Int("sp", 0, "Source port number")
 	dest := flag.String("d", "", "Destination multiaddr string")
+	key := flag.String("o", "", "OTP key")
 	help := flag.Bool("help", false, "Display help")
 	flag.Parse()
 
@@ -106,8 +77,6 @@ func main() {
 	logrus.Info("Host created. We are:", h.ID())
 	logrus.Info(h.Addrs())
 
-	h.SetStreamHandler("/chat/1.0.0", handleStream)
-
 	var bootstrapPeers []peer.AddrInfo
 	if dest != nil && len(*dest) > 0 {
 		peerAddrInfo, err := getPeerAddrInfo(*dest)
@@ -127,14 +96,11 @@ func main() {
 	// inhibiting future peer discovery.
 	// Construct a datastore (needed by the DHT). This is just a simple, in-memory thread-safe datastore.
 	dstore := dsync.MutexWrap(ds.NewMapDatastore())
-	kademliaDHT := dht.NewDHT(ctx, h, dstore)
-	routedHost := routedhost.Wrap(h, kademliaDHT)
-
-	addrs := routedHost.Addrs()
-	hostAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ipfs/%s", routedHost.ID()))
-	for _, addr := range addrs {
-		logrus.Println("Address: ", addr.Encapsulate(hostAddr))
+	kademliaDHT, err := dht.New(ctx, h, dht.Datastore(dstore), dht.Mode(dht.ModeServer))
+	if err != nil {
+		logrus.Fatal("Failed to create DHT: ", err)
 	}
+	routedHost := routedhost.Wrap(h, kademliaDHT)
 
 	// Bootstrap the DHT. In the default configuration, this spawns a Background
 	// thread that will refresh the peer table every five minutes.
@@ -142,17 +108,42 @@ func main() {
 	if err = kademliaDHT.Bootstrap(ctx); err != nil {
 		panic(err)
 	}
-	kademliaDHT.Host()
 
 	time.Sleep(1 * time.Second)
-
-	rendezvous := "cluster-xxx"
 	routingDiscovery := drouting.NewRoutingDiscovery(kademliaDHT)
-	dutil.Advertise(ctx, routingDiscovery, rendezvous, discovery.TTL(10*time.Second))
-	peers, err := routingDiscovery.FindPeers(ctx, rendezvous)
-	if err != nil {
-		logrus.Fatal("Failed to find peers: ", err)
+
+	if key == nil {
+		defaultKey := "test"
+		key = &defaultKey
 	}
+
+	addrs := routedHost.Addrs()
+	hostAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ipfs/%s", routedHost.ID()))
+	for _, addr := range addrs {
+		join := fmt.Sprintf("./p2p -d %s -o %s", addr.Encapsulate(hostAddr), *key)
+		logrus.Info("Join with: ", join)
+	}
+
+	// generate one time rendezvous string as otp
+	go func() {
+		ttl := 5 * time.Second
+		for {
+			// generate random string
+			otp := TOTP(10, *key)
+			logrus.Info("OTP: ", otp)
+			_, _ = routingDiscovery.Advertise(ctx, otp)
+			time.Sleep(1 * time.Second)
+
+			peerChans, err := routingDiscovery.FindPeers(ctx, otp)
+			if err != nil {
+				logrus.Error("Failed to find peers: ", err)
+			} else {
+				connectToPeers(ctx, routedHost, peerChans)
+			}
+
+			time.Sleep(ttl)
+		}
+	}()
 
 	go func() {
 		for {
@@ -167,7 +158,7 @@ func main() {
 						logrus.Info("Removing peer: ", peer)
 						routedHost.Peerstore().RemovePeer(p)
 						routedHost.Peerstore().ClearAddrs(p)
-						routedHost.Network().ClosePeer(p)
+						_ = routedHost.Network().ClosePeer(p)
 						kademliaDHT.RoutingTable().RemovePeer(p)
 						continue
 					}
@@ -178,15 +169,31 @@ func main() {
 		}
 	}()
 
-	for peer := range peers {
-		if peer.ID == h.ID() {
-			continue
-		}
-		logrus.Info("Found peer:", peer.ID)
-	}
-
 	// Wait forever
 	select {}
+}
+
+func connectToPeers(ctx context.Context, h host.Host, peerChans <-chan peer.AddrInfo) {
+	logrus.Info("Connecting to peers", len(peerChans))
+	for pc := range peerChans {
+		if pc.ID == h.ID() || len(pc.Addrs) == 0 {
+			continue
+		}
+
+		if h.Network().Connectedness(pc.ID) != network.Connected {
+			logrus.Info("Found peer: ", pc.ID)
+			if err := h.Connect(ctx, pc); err != nil {
+				logrus.Error("Failed to connect to peer: ", err)
+				continue
+			} else {
+				logrus.Info("Connected to peer: ", pc.ID)
+			}
+		} else {
+			logrus.Info("Already connected to peer: ", pc.ID)
+		}
+		h.Peerstore().ClearAddrs(pc.ID)
+		h.Peerstore().AddAddrs(pc.ID, pc.Addrs, peerstore.PermanentAddrTTL)
+	}
 }
 
 func getPeerAddrInfo(dest string) (*peer.AddrInfo, error) {
