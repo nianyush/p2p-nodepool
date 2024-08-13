@@ -44,6 +44,9 @@ func TOTP(t int, key string) string {
 	return cfg.TOTP()
 }
 
+var peers = make(map[peer.ID]struct{})
+var mutext sync.Mutex
+
 func main() {
 	logrus.SetLevel(logrus.DebugLevel)
 
@@ -101,7 +104,6 @@ func main() {
 		logrus.Fatal("Failed to create DHT: ", err)
 	}
 	routedHost := routedhost.Wrap(h, kademliaDHT)
-
 	// Bootstrap the DHT. In the default configuration, this spawns a Background
 	// thread that will refresh the peer table every five minutes.
 	logrus.Debug("Bootstrapping the DHT")
@@ -130,11 +132,11 @@ func main() {
 		for {
 			// generate random string
 			otp := TOTP(10, *key)
-			logrus.Info("OTP: ", otp)
 
 			if rendezvous != nil && len(*rendezvous) > 0 {
 				otp = *rendezvous
 			}
+			logrus.Info("OTP: ", otp)
 
 			_, _ = routingDiscovery.Advertise(ctx, otp)
 			time.Sleep(1 * time.Second)
@@ -153,8 +155,8 @@ func main() {
 	go func() {
 		for {
 			logrus.Info("-------------------------")
-			logrus.Info("Peers in the network:")
-			for _, p := range routedHost.Peerstore().Peers() {
+			logrus.Info("Peers:")
+			for p := range peers {
 				peer := routedHost.Peerstore().PeerInfo(p)
 				logrus.Info("Peer: ", peer)
 				if p != h.ID() {
@@ -165,6 +167,9 @@ func main() {
 						routedHost.Peerstore().ClearAddrs(p)
 						_ = routedHost.Network().ClosePeer(p)
 						kademliaDHT.RoutingTable().RemovePeer(p)
+						mutext.Lock()
+						delete(peers, p)
+						mutext.Unlock()
 						continue
 					}
 				}
@@ -196,8 +201,9 @@ func connectToPeers(ctx context.Context, h host.Host, peerChans <-chan peer.Addr
 		} else {
 			logrus.Info("Already connected to peer: ", pc.ID)
 		}
-		h.Peerstore().ClearAddrs(pc.ID)
-		h.Peerstore().AddAddrs(pc.ID, pc.Addrs, peerstore.PermanentAddrTTL)
+		mutext.Lock()
+		peers[pc.ID] = struct{}{}
+		mutext.Unlock()
 	}
 }
 
