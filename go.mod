@@ -1,4 +1,4 @@
-module github.com/nianyush/p2p-example
+module github.com/nianyush/p2p-nodepool
 
 go 1.22.4
 
